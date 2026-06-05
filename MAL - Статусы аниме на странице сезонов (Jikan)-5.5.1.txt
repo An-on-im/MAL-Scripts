@@ -1,0 +1,730 @@
+// ==UserScript==
+// @name         MAL - Статусы аниме на странице сезонов (Jikan)
+// @namespace    http://tampermonkey.net/
+// @version      5.5.1
+// @description  Статусы аниме на странице сезонов.
+// @author       User
+// @match        https://myanimelist.net/anime/season*
+// @match        https://myanimelist.net/anime/season/*/*
+// @icon         https://cdn.myanimelist.net/images/favicon.svg
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const DEBUG = false;
+    const MAX_RETRIES = 3;
+    const MIN_REQUEST_INTERVAL = 600;
+    const CACHE_DURATION = 24 * 60 * 60 * 1000;
+
+    const log = (...args) => { if (DEBUG) console.log('[MALStatus]', ...args); };
+    const info = (...args) => console.log('[MALStatus]', ...args);
+    const warn = (...args) => console.warn('[MALStatus]', ...args);
+    const error = (...args) => console.error('[MALStatus]', ...args);
+
+    info('Script loaded');
+
+    // ---------- Глобальный кэш статусов (по ID) ----------
+    const CACHE_KEY = 'mal_status_cache';
+    let cacheMap = new Map();
+
+    function loadCacheFromStorage() {
+        try {
+            const raw = GM_getValue(CACHE_KEY, '{}');
+            const data = JSON.parse(raw);
+            const now = Date.now();
+            for (const [id, entry] of Object.entries(data)) {
+                if (now - entry.t < CACHE_DURATION) {
+                    cacheMap.set(parseInt(id), { s: entry.s, t: entry.t });
+                }
+            }
+            info(`Cache loaded: ${cacheMap.size} entries`);
+        } catch (e) {
+            error('Cache parse error', e);
+        }
+    }
+
+    function saveToCache(id, status) {
+        cacheMap.set(id, { s: status, t: Date.now() });
+        const obj = {};
+        for (const [key, val] of cacheMap.entries()) {
+            obj[key] = { s: val.s, t: val.t };
+        }
+        GM_setValue(CACHE_KEY, JSON.stringify(obj));
+        log(`Cache saved: #${id} -> status ${status}`);
+    }
+
+    function getStatusFromCache(id) {
+        const entry = cacheMap.get(id);
+        if (entry && (Date.now() - entry.t < CACHE_DURATION)) {
+            return entry.s;
+        }
+        return null;
+    }
+
+    // ---------- animeMap ----------
+    let animeMap = new Map();
+
+    // ---------- Параметры страницы ----------
+    const SORT_MAP = {
+        members:    { order_by: 'members',    sort: 'desc' },
+        score:      { order_by: 'score',      sort: 'desc' },
+        start_date: { order_by: 'start_date', sort: 'desc' },
+        title:      { order_by: 'title',      sort: 'asc'  }
+    };
+    const DEFAULT_SORT = { order_by: 'members', sort: 'desc' };
+
+    function getSelectedSortParams() {
+        const container = document.querySelector('#sort');
+        if (!container) return DEFAULT_SORT;
+        const sel = container.querySelector('.selected');
+        if (!sel || !sel.id) return DEFAULT_SORT;
+        return SORT_MAP[sel.id] || DEFAULT_SORT;
+    }
+
+    /**
+     * Определяет ключ сезона (например "2026_spring")
+     * Для /anime/season использует текущую дату,
+     * для явных URL парсит путь.
+     */
+    function getSeasonKey() {
+        const path = window.location.pathname;
+        // Явный сезон: /anime/season/2025/spring
+        const m = path.match(/\/anime\/season\/(\d+)\/(spring|summer|fall|winter)/);
+        if (m) return `${m[1]}_${m[2]}`;
+
+        // /anime/season — текущий сезон по дате
+        if (path === '/anime/season') {
+            return getCurrentSeasonKey();
+        }
+        return null;
+    }
+
+    /**
+     * Возвращает ключ текущего сезона на основе системной даты пользователя
+     */
+    function getCurrentSeasonKey() {
+        const now = new Date();
+        const month = now.getMonth(); // 0-11
+        const year = now.getFullYear();
+        let season;
+        if (month >= 0 && month <= 2) season = 'winter';      // янв-март
+        else if (month >= 3 && month <= 5) season = 'spring'; // апр-июнь
+        else if (month >= 6 && month <= 8) season = 'summer'; // июль-сент
+        else season = 'fall';                                  // окт-дек
+        return `${year}_${season}`;
+    }
+
+    // ---------- Rate limiter ----------
+    let lastRequestStart = 0;
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+    async function rateLimit() {
+        const now = Date.now();
+        const wait = Math.max(0, MIN_REQUEST_INTERVAL - (now - lastRequestStart));
+        if (wait > 0) {
+            log(`Rate limit: waiting ${wait}ms`);
+            await delay(wait);
+        }
+    }
+    function markRequestStart() { lastRequestStart = Date.now(); }
+
+    // ---------- HTTP ----------
+    function fetchJikan(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout: 15000,
+                onload: r => r.status === 200 ? resolve(r) : reject({ status: r.status }),
+                onerror: () => reject({ status: 0 }),
+                ontimeout: () => reject({ status: 0 })
+            });
+        });
+    }
+
+    // ---------- Статусы ----------
+    const STATUS_TEXT = { 1: 'Онгоинг', 2: 'Выпущен', 3: 'Не начат' };
+
+    function parseStatusFromJikan(data) {
+        if (!data || !data.status) return 0;
+        if (data.status === 'Currently Airing') return 1;
+        if (data.status === 'Finished Airing') return 2;
+        if (data.status === 'Not yet aired') return 3;
+        return 0;
+    }
+
+    // ---------- Карточки ----------
+    function animeIdFromCard(card) {
+        const a = card.querySelector('a.link-title');
+        if (!a) return null;
+        const m = a.href.match(/\/anime\/(\d+)/);
+        return m ? parseInt(m[1]) : null;
+    }
+
+    function setBadge(card, code) {
+        const old = card.querySelector('.status-badge');
+        if (old) old.remove();
+        const infoDiv = card.querySelector('.info');
+        if (!infoDiv) return;
+        const span = document.createElement('span');
+        span.className = 'item status-badge';
+        if (code === 0) {
+            span.textContent = 'ОШИБКА';
+            span.classList.add('error-badge');
+            card.setAttribute('data-mal-status', '0');
+        } else {
+            span.textContent = STATUS_TEXT[code] || '???';
+            card.setAttribute('data-mal-status', String(code));
+        }
+        infoDiv.appendChild(span);
+    }
+
+    function refreshCards(finalReport = false) {
+        const cards = document.querySelectorAll('.js-seasonal-anime, .seasonal-anime');
+        let known = 0, missing = 0;
+        const missingIds = [];
+        cards.forEach(card => {
+            const id = animeIdFromCard(card);
+            if (!id) { missing++; return; }
+            card.setAttribute('data-anime-id', id);
+            const entry = animeMap.get(id);
+            if (entry && entry.status > 0) {
+                setBadge(card, entry.status);
+                known++;
+            } else {
+                const cachedStatus = getStatusFromCache(id);
+                if (cachedStatus !== null && cachedStatus > 0) {
+                    animeMap.set(id, { status: cachedStatus, retries: 0 });
+                    setBadge(card, cachedStatus);
+                    known++;
+                } else {
+                    setBadge(card, 0);
+                    missing++;
+                    missingIds.push(id);
+                    if (!animeMap.has(id)) {
+                        animeMap.set(id, { status: 0, retries: 0 });
+                    }
+                }
+            }
+        });
+
+        updateProgressFromCards(known, cards.length);
+
+        if (finalReport) {
+            if (missing) {
+                warn(`Status coverage: ${known}/${cards.length} (${missing} missing)`);
+                if (missingIds.length) {
+                    warn('Missing IDs: ' + missingIds.slice(0, 20).join(', ') + (missingIds.length > 20 ? '...' : ''));
+                }
+            } else {
+                info(`Status coverage: ${known}/${cards.length} (complete)`);
+            }
+        }
+    }
+
+    // ---------- Фильтр ----------
+    let currentFilter = 0;
+    function loadFilter() {
+        const v = GM_getValue('mal_status_filter', 0);
+        return (v >= 0 && v <= 3) ? v : 0;
+    }
+    function saveFilter(v) { GM_setValue('mal_status_filter', v); }
+
+    function applyFilter() {
+        const cards = document.querySelectorAll('.js-seasonal-anime, .seasonal-anime');
+        cards.forEach(card => {
+            const st = card.getAttribute('data-mal-status');
+            if (currentFilter === 0 || (st && parseInt(st) === currentFilter)) {
+                card.classList.remove('status-filter-hidden');
+            } else {
+                card.classList.add('status-filter-hidden');
+            }
+        });
+    }
+
+    function onFilterChange(val) {
+        currentFilter = val;
+        saveFilter(val);
+        document.querySelectorAll('.js-status-option').forEach(item => {
+            const v = parseInt(item.getAttribute('data-value'));
+            const check = item.querySelector('.fa-check');
+            if (v === val) {
+                item.classList.add('selected');
+                if (check) check.style.display = '';
+            } else {
+                item.classList.remove('selected');
+                if (check) check.style.display = 'none';
+            }
+        });
+        applyFilter();
+    }
+
+    // ---------- UI фильтра ----------
+    function buildFilterUI() {
+        const container = document.querySelector('.horiznav-nav-seasonal');
+        if (!container) return;
+        container.querySelectorAll('.btn-show-sort.status, .seasonal-sort-order-block.status').forEach(e => e.remove());
+
+        const btn = document.createElement('span');
+        btn.className = 'fl-r btn-show-sort status mr12';
+        btn.setAttribute('data-id', 'status');
+        btn.textContent = 'Status';
+        btn.style.cursor = 'pointer'; btn.style.userSelect = 'none';
+        const broadcast = container.querySelector('.btn-show-broadcast');
+        if (broadcast && broadcast.parentNode) {
+            broadcast.parentNode.insertBefore(btn, broadcast.nextSibling);
+        } else container.prepend(btn);
+
+        const block = document.createElement('div');
+        block.className = 'seasonal-sort-order-block status js-seasonal-sort-order-block';
+        block.style.display = 'none';
+        block.innerHTML = `
+            <span class="fl-r btn-close js-btn-close"><i class="fa-solid fa-times"></i></span>
+            <ul class="sort-order-list" id="status-list">
+                <li class="js-status-option btn-sort-order fa-stack" data-value="0" style="width:auto;height:1.2em;">
+                    <i class="fa-regular fa-square fa-stack-2x"></i><i class="fa-solid fa-check fa-stack-1x" style="display:none;"></i>Все статусы</li>
+                <li class="js-status-option btn-sort-order fa-stack ml12" data-value="1" style="width:auto;height:1.2em;">
+                    <i class="fa-regular fa-square fa-stack-2x"></i><i class="fa-solid fa-check fa-stack-1x" style="display:none;"></i>Онгоинг</li>
+                <li class="js-status-option btn-sort-order fa-stack ml12" data-value="2" style="width:auto;height:1.2em;">
+                    <i class="fa-regular fa-square fa-stack-2x"></i><i class="fa-solid fa-check fa-stack-1x" style="display:none;"></i>Выпущен</li>
+                <li class="js-status-option btn-sort-order fa-stack ml12" data-value="3" style="width:auto;height:1.2em;">
+                    <i class="fa-regular fa-square fa-stack-2x"></i><i class="fa-solid fa-check fa-stack-1x" style="display:none;"></i>Не начат</li>
+            </ul>`;
+        container.appendChild(block);
+
+        const active = block.querySelector(`.js-status-option[data-value="${currentFilter}"]`);
+        if (active) { active.classList.add('selected'); active.querySelector('.fa-check').style.display = ''; }
+
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            block.style.display = block.style.display === 'block' ? 'none' : 'block';
+        });
+        block.querySelector('.js-btn-close').addEventListener('click', () => block.style.display = 'none');
+        block.querySelectorAll('.js-status-option').forEach(opt => {
+            opt.addEventListener('click', e => {
+                e.stopPropagation();
+                onFilterChange(parseInt(opt.getAttribute('data-value')));
+                block.style.display = 'none';
+            });
+        });
+        document.addEventListener('click', e => {
+            if (block.style.display === 'block' && !block.contains(e.target) && e.target !== btn) {
+                block.style.display = 'none';
+            }
+        });
+    }
+
+    // ---------- Прогресс-бар ----------
+    let progressBar, progressText, progressFill;
+
+    function createProgressBar() {
+        const container = document.querySelector('.js-categories-seasonal');
+        if (!container) return;
+        const old = document.getElementById('mal-status-progress-container');
+        if (old) old.remove();
+        const pb = document.createElement('div');
+        pb.id = 'mal-status-progress-container';
+        pb.style.margin = '0 0 8px 0';
+        pb.style.padding = '4px 0';
+        pb.innerHTML = `
+            <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                <span id="mal-status-progress-text">Подготовка...</span>
+            </div>
+            <div style="background:#333;height:4px;border-radius:2px;">
+                <div id="mal-status-progress-bar" style="width:0%;height:100%;background:#4caf50;border-radius:2px;transition:width 0.3s;"></div>
+            </div>`;
+        container.prepend(pb);
+        progressBar = pb;
+        progressText = pb.querySelector('#mal-status-progress-text');
+        progressFill = pb.querySelector('#mal-status-progress-bar');
+    }
+
+    function updateProgressFromCards(known, total) {
+        if (!progressBar) return;
+        if (total === 0) {
+            progressText.textContent = 'Подготовка...';
+            progressFill.style.width = '0%';
+            return;
+        }
+        const pct = Math.round((known / total) * 100);
+        progressText.textContent = `Загружено ${known}/${total}`;
+        progressFill.style.width = pct + '%';
+
+        const allDone = (known === total) && !pageQueueActive && !idQueueActive;
+        if (allDone) {
+            progressText.textContent = 'Готово';
+            setTimeout(() => {
+                if (progressBar && progressText.textContent === 'Готово') {
+                    progressBar.style.display = 'none';
+                }
+            }, 2000);
+        } else if (progressBar.style.display === 'none') {
+            progressBar.style.display = '';
+        }
+    }
+
+    // ---------- Очереди ----------
+    let pageQueue = [];
+    let idQueue = [];
+    let pageQueueActive = false;
+    let idQueueActive = false;
+    let cancelAll = false;
+
+    async function processPageQueue(seasonKey) {
+        pageQueueActive = true;
+        while (pageQueue.length > 0 && !cancelAll) {
+            const task = pageQueue.shift();
+            const url = `${task.baseUrl}&page=${task.page}`;
+            let retries = task.retries || 0;
+            try {
+                await rateLimit();
+                markRequestStart();
+                const res = await fetchJikan(url);
+                const json = JSON.parse(res.responseText);
+                processJikanPage(json.data, task.page);
+            } catch (err) {
+                const httpStatus = err.status || 0;
+                warn(`Page ${task.page} failed: ${httpStatus}`);
+                if (retries < 3) {
+                    task.retries = retries + 1;
+                    pageQueue.push(task);
+                } else {
+                    error(`Page ${task.page} failed after retries`);
+                }
+            }
+        }
+        pageQueueActive = false;
+        if (!cancelAll) {
+            if (seasonKey) markSeasonAsLoaded(seasonKey);
+            collectAndProcessMissingIds(seasonKey);
+        }
+    }
+
+    async function processIdQueue(seasonKey) {
+        idQueueActive = true;
+        while (idQueue.length > 0 && !cancelAll) {
+            const id = idQueue.shift();
+            const entry = animeMap.get(id);
+            if (!entry || entry.retries >= MAX_RETRIES) continue;
+
+            const cached = getStatusFromCache(id);
+            if (cached !== null && cached > 0) {
+                entry.status = cached;
+                entry.retries = 0;
+                const card = document.querySelector(`.js-seasonal-anime[data-anime-id="${id}"], .seasonal-anime[data-anime-id="${id}"]`);
+                if (card) setBadge(card, cached);
+                refreshCards(false);
+                applyFilter();
+                continue;
+            }
+
+            try {
+                await rateLimit();
+                markRequestStart();
+                const res = await fetchJikan(`https://api.jikan.moe/v4/anime/${id}`);
+                const json = JSON.parse(res.responseText);
+                const status = parseStatusFromJikan(json.data);
+                entry.status = status;
+                entry.retries = 0;
+                saveToCache(id, status);
+                log(`Fetched #${id}: status ${status}`);
+                const card = document.querySelector(`.js-seasonal-anime[data-anime-id="${id}"], .seasonal-anime[data-anime-id="${id}"]`);
+                if (card) setBadge(card, status);
+                refreshCards(false);
+                applyFilter();
+            } catch (err) {
+                const httpStatus = err.status || 0;
+                warn(`Failed #${id}: ${httpStatus}`);
+                entry.retries = (entry.retries || 0) + 1;
+                if (entry.retries < MAX_RETRIES) {
+                    idQueue.push(id);
+                } else {
+                    error(`Giving up on #${id}`);
+                    refreshCards(false);
+                    applyFilter();
+                }
+            }
+        }
+        idQueueActive = false;
+        if (!cancelAll) {
+            if (seasonKey && !isSeasonLoaded(seasonKey)) {
+                markSeasonAsLoaded(seasonKey);
+            }
+            const cards = document.querySelectorAll('.js-seasonal-anime, .seasonal-anime');
+            const known = Array.from(cards).filter(c => parseInt(c.getAttribute('data-mal-status')) > 0).length;
+            updateProgressFromCards(known, cards.length);
+            if (known === cards.length) {
+                info('All tasks completed');
+            }
+        }
+    }
+
+    function collectAndProcessMissingIds(seasonKey) {
+        const cards = document.querySelectorAll('.js-seasonal-anime, .seasonal-anime');
+        const ids = new Set();
+        cards.forEach(card => {
+            const id = animeIdFromCard(card);
+            if (id) ids.add(id);
+        });
+        for (const id of ids) {
+            const entry = animeMap.get(id);
+            if (!entry || entry.status === 0) {
+                if (!idQueue.includes(id)) {
+                    idQueue.push(id);
+                }
+            }
+        }
+        if (idQueue.length > 0 && !idQueueActive) {
+            processIdQueue(seasonKey);
+        }
+    }
+
+    function processJikanPage(data, page) {
+        if (!data) return;
+        let addedKnown = 0, addedUnknown = 0;
+        data.forEach(a => {
+            const id = a.mal_id;
+            const code = parseStatusFromJikan(a);
+            if (!animeMap.has(id)) {
+                animeMap.set(id, { status: code, retries: 0 });
+            } else {
+                const entry = animeMap.get(id);
+                if (code > 0 && entry.status === 0) {
+                    entry.status = code;
+                }
+            }
+            if (code > 0) {
+                saveToCache(id, code);
+                addedKnown++;
+            } else {
+                addedUnknown++;
+            }
+        });
+        log(`Page ${page}: known=${addedKnown}, unknown=${addedUnknown}`);
+        refreshCards(false);
+        applyFilter();
+    }
+
+    // ---------- Кэш сезонов ----------
+    const SEASON_FETCH_KEY = 'mal_season_fetch_ts';
+
+    function getSeasonFetchTs() {
+        try {
+            const raw = GM_getValue(SEASON_FETCH_KEY, '{}');
+            return JSON.parse(raw);
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function isSeasonLoaded(seasonKey) {
+        const ts = getSeasonFetchTs();
+        const stored = ts[seasonKey];
+        return stored && (Date.now() - stored < CACHE_DURATION);
+    }
+
+    function markSeasonAsLoaded(seasonKey) {
+        const ts = getSeasonFetchTs();
+        ts[seasonKey] = Date.now();
+        GM_setValue(SEASON_FETCH_KEY, JSON.stringify(ts));
+        info(`Season ${seasonKey} marked as loaded`);
+    }
+
+    // ---------- Загрузка сезона ----------
+    let currentSeasonKey = null;
+    let currentSortParams = null;
+
+    async function startFullLoad(seasonKey, sortParams) {
+        cancelAll = false;
+        currentSeasonKey = seasonKey;
+        currentSortParams = sortParams;
+        animeMap.clear();
+        pageQueue = [];
+        idQueue = [];
+        pageQueueActive = false;
+        idQueueActive = false;
+        document.querySelectorAll('.status-badge').forEach(e => e.remove());
+        document.querySelectorAll('.js-seasonal-anime, .seasonal-anime').forEach(c => c.removeAttribute('data-mal-status'));
+
+        createProgressBar();
+
+        const [year, season] = seasonKey.split('_');
+        const baseUrl = `https://api.jikan.moe/v4/seasons/${year}/${season}?order_by=${sortParams.order_by}&sort=${sortParams.sort}`;
+
+        try {
+            await rateLimit();
+            markRequestStart();
+            const res = await fetchJikan(`${baseUrl}&page=1`);
+            const json = JSON.parse(res.responseText);
+            const totalPages = json.pagination ? json.pagination.last_visible_page : 1;
+            processJikanPage(json.data, 1);
+            for (let p = 2; p <= totalPages; p++) {
+                pageQueue.push({ page: p, baseUrl, retries: 0 });
+            }
+            if (pageQueue.length > 0) {
+                processPageQueue(seasonKey);
+            } else {
+                markSeasonAsLoaded(seasonKey);
+                collectAndProcessMissingIds(seasonKey);
+            }
+        } catch (err) {
+            error('Failed to load first page', err);
+        }
+    }
+
+    async function startQuickLoad(seasonKey) {
+        cancelAll = false;
+        currentSeasonKey = seasonKey;
+        animeMap.clear();
+        pageQueue = [];
+        idQueue = [];
+        pageQueueActive = false;
+        idQueueActive = false;
+        document.querySelectorAll('.status-badge').forEach(e => e.remove());
+        document.querySelectorAll('.js-seasonal-anime, .seasonal-anime').forEach(c => c.removeAttribute('data-mal-status'));
+
+        createProgressBar();
+
+        const cards = document.querySelectorAll('.js-seasonal-anime, .seasonal-anime');
+        cards.forEach(card => {
+            const id = animeIdFromCard(card);
+            if (id) {
+                const cached = getStatusFromCache(id);
+                if (cached !== null && cached > 0) {
+                    if (!animeMap.has(id)) {
+                        animeMap.set(id, { status: cached, retries: 0 });
+                    } else if (animeMap.get(id).status === 0) {
+                        animeMap.get(id).status = cached;
+                    }
+                }
+            }
+        });
+
+        refreshCards(true);
+        applyFilter();
+        collectAndProcessMissingIds(seasonKey);
+
+        const known = Array.from(cards).filter(c => parseInt(c.getAttribute('data-mal-status')) > 0).length;
+        updateProgressFromCards(known, cards.length);
+    }
+
+    function resetAndReloadIfNeeded() {
+        const newSort = getSelectedSortParams();
+        if (!currentSortParams || (currentSortParams.order_by === newSort.order_by && currentSortParams.sort === newSort.sort)) {
+            return;
+        }
+        if (currentSeasonKey && isSeasonLoaded(currentSeasonKey)) {
+            log('Sort changed but season already loaded; refreshing cards without reload');
+            setTimeout(() => {
+                refreshCards(false);
+                collectAndProcessMissingIds(currentSeasonKey);
+                applyFilter();
+            }, 300);
+            currentSortParams = newSort;
+            return;
+        }
+        cancelAll = true;
+        pageQueueActive = false;
+        idQueueActive = false;
+        animeMap.clear();
+        pageQueue = [];
+        idQueue = [];
+        document.querySelectorAll('.status-badge').forEach(e => e.remove());
+        document.querySelectorAll('.js-seasonal-anime, .seasonal-anime').forEach(c => c.removeAttribute('data-mal-status'));
+        createProgressBar();
+        currentSortParams = newSort;
+        startFullLoad(currentSeasonKey, newSort);
+    }
+
+    function watchSortChange() {
+        document.addEventListener('click', e => {
+            const btn = e.target.closest('.js-btn-sort-order');
+            if (!btn) return;
+            setTimeout(() => {
+                resetAndReloadIfNeeded();
+            }, 200);
+        });
+    }
+
+    function setupObserver() {
+        const target = document.querySelector('.js-categories-seasonal');
+        if (!target) return;
+        const obs = new MutationObserver(mutations => {
+            let added = false;
+            for (const m of mutations) {
+                if (m.addedNodes.length) {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType === 1 && (
+                            node.matches?.('.js-seasonal-anime, .seasonal-anime') ||
+                            node.querySelector?.('.js-seasonal-anime, .seasonal-anime')
+                        )) {
+                            added = true;
+                            break;
+                        }
+                    }
+                }
+                if (added) break;
+            }
+            if (added) {
+                log('New cards detected');
+                refreshCards(false);
+                if (currentSeasonKey) {
+                    collectAndProcessMissingIds(currentSeasonKey);
+                }
+                applyFilter();
+            }
+        });
+        obs.observe(target, { childList: true, subtree: true });
+    }
+
+    function addStyles() {
+        const style = document.createElement('style');
+        style.textContent = `
+            .status-filter-hidden { display: none !important; }
+            .status-badge { margin-left:8px; padding:2px 6px; border-radius:12px; font-size:11px; font-weight:bold; color:#e6e6e6; background:#3b3b3b; }
+            .error-badge { background:#c0392b; color:white; }
+            .seasonal-sort-order-block.status { width:200px; right:0; left:auto !important; }
+        `;
+        document.head.appendChild(style);
+    }
+
+    async function init() {
+        addStyles();
+        loadCacheFromStorage();
+
+        const seasonKey = getSeasonKey();
+        if (!seasonKey) {
+            error('Could not determine season key.');
+            return;
+        }
+
+        currentFilter = loadFilter();
+        buildFilterUI();
+        createProgressBar();
+
+        currentSeasonKey = seasonKey;
+        const sortParams = getSelectedSortParams();
+        currentSortParams = sortParams;
+
+        if (isSeasonLoaded(seasonKey)) {
+            info(`Season ${seasonKey} already loaded; using cached data.`);
+            await startQuickLoad(seasonKey);
+        } else {
+            info(`Season ${seasonKey} not loaded; performing full fetch.`);
+            await startFullLoad(seasonKey, sortParams);
+        }
+
+        setupObserver();
+        watchSortChange();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();

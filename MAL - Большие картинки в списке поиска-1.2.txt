@@ -1,0 +1,82 @@
+// ==UserScript==
+// @name         MAL - Большие картинки в списке поиска
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Заменяет миниатюры в списке на оригинальные изображения (без /r/... и параметров), как в блочном виде.
+// @author       User
+// @match        https://myanimelist.net/anime.php*
+// @match        https://myanimelist.net/anime/genre/*
+// @match        https://myanimelist.net/anime/season/*
+// @match        https://myanimelist.net/anime/producer/*
+// @match        https://myanimelist.net/topanime.php*
+// @match        https://myanimelist.net/topmanga.php*
+// @icon         https://cdn.myanimelist.net/images/favicon.svg
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    function cleanImageUrl(url) {
+        // Убираем /r/любые_цифрыxцифры/ и всё после '?'
+        return url.replace(/\/r\/\d+x\d+\//, '/').split('?')[0];
+    }
+
+    function processImage(img) {
+        if (img.dataset.processed === 'true') return;
+
+        // Получаем исходный URL (обычно он в data-src)
+        let originalUrl = img.dataset.src || img.src;
+        if (!originalUrl || originalUrl.includes('spacer.gif')) return;
+
+        // Чистим URL
+        const cleanUrl = cleanImageUrl(originalUrl);
+
+        // Обновляем атрибуты
+        img.src = cleanUrl;
+        img.dataset.src = cleanUrl;
+        // Удаляем srcset, чтобы браузер не подгружал другие размеры
+        img.removeAttribute('srcset');
+        img.removeAttribute('data-srcset');
+
+        // Устанавливаем размеры как в блоках
+        img.width = 167;
+        img.style.width = '167px';
+        img.style.height = 'auto';
+        img.style.objectFit = 'contain';
+
+        // Расширяем ячейку
+        const imgCell = img.closest('td');
+        if (imgCell) {
+            imgCell.style.width = 'auto';
+            imgCell.style.padding = '4px';
+        }
+        const picDiv = img.closest('.picSurround');
+        if (picDiv) {
+            picDiv.style.width = 'auto';
+            picDiv.style.height = 'auto';
+        }
+
+        img.dataset.processed = 'true';
+    }
+
+    function enlargeImages() {
+        const rows = document.querySelectorAll('.js-block-list.list table tbody tr');
+        for (const row of rows) {
+            const img = row.querySelector('td:first-child img');
+            if (img) processImage(img);
+        }
+    }
+
+    // Первичная обработка
+    enlargeImages();
+
+    // Наблюдение за изменениями (подгрузка новых строк при пагинации/фильтрации)
+    const observer = new MutationObserver(enlargeImages);
+    const listContainer = document.querySelector('.js-block-list.list');
+    if (listContainer) {
+        observer.observe(listContainer, { childList: true, subtree: true });
+    }
+    observer.observe(document.body, { childList: true, subtree: true });
+})();

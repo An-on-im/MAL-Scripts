@@ -1,0 +1,309 @@
+// ==UserScript==
+// @name         MAL - Перевод описаний
+// @namespace    http://tampermonkey.net/
+// @version      3.1
+// @description  Переводит синопсисы. Синопсисы в списке могут быть с поломанным форматирвоанием, соответственно и перевод будет кривоват.
+// @author       User
+// @match        https://myanimelist.net/anime/*
+// @match        https://myanimelist.net/season/*
+// @icon         https://cdn.myanimelist.net/images/favicon.svg
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const CACHE_PREFIX = 'mal_syn_ru_';
+    const TRANSLATE_ICON = '⇄';
+    const BUTTON_TITLE_ORIG = 'Перевести на русский';
+    const BUTTON_TITLE_TRANS = 'Показать оригинал';
+    const OUTDATED_MARKER = '[УСТАРЕЛ] ';
+
+    GM_addStyle(`
+        .mal-synopsis-translate-btn {
+            display: inline-block;
+            margin-left: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            color: #4e7ea6;
+            cursor: pointer;
+            user-select: none;
+            transition: transform 0.2s;
+            vertical-align: middle;
+        }
+        .mal-synopsis-translate-btn:hover {
+            color: #1d439b;
+            transform: scale(1.1);
+        }
+        .mal-synopsis-translate-btn.loading {
+            opacity: 0.6;
+            cursor: wait;
+            animation: mal-spin 1s linear infinite;
+        }
+        @keyframes mal-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    `);
+
+    function simpleHash(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        return hash.toString(16);
+    }
+
+    function extractAnimeId(context) {
+        if (context && context.querySelector) {
+            const link = context.querySelector('h2 a, .title a');
+            if (link) {
+                const match = link.href.match(/\/anime\/(\d+)/);
+                return match ? match[1] : null;
+            }
+        }
+        const urlMatch = location.pathname.match(/\/anime\/(\d+)/);
+        return urlMatch ? urlMatch[1] : null;
+    }
+
+    async function translateHTML(html) {
+        // Защищаем <br> и <br/> от удаления
+        const protectedHtml = html.replace(/<br\s*\/?>/gi, '[[BR]]');
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ru&dt=t&format=html&q=${encodeURIComponent(protectedHtml)}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        let translated = data[0].map(item => item[0]).join('');
+        // Восстанавливаем <br>
+        translated = translated.replace(/\[\[BR\]\]/gi, '<br>');
+        return translated;
+    }
+
+    async function setupSynopsisBlock({
+        container,
+        buttonParent,
+        animeId,
+        cacheKey
+    }) {
+        if (!container || !buttonParent || !animeId) return;
+        if (buttonParent.querySelector('.mal-synopsis-translate-btn')) return;
+
+        const originalHTML = container.innerHTML;
+        const originalText = container.textContent.trim();
+        const currentHash = simpleHash(originalText);
+
+        let currentTranslationHTML = null;
+        let isStale = false;
+        let showingTranslation = false;
+        let fetchPromise = null;
+
+        let cached = GM_getValue(cacheKey);
+        let cachedHTML = null;
+        let cachedHash = null;
+        if (cached) {
+            try {
+                const parsed = JSON.parse(cached);
+                if (parsed.hash && parsed.html) {
+                    cachedHash = parsed.hash;
+                    cachedHTML = parsed.html;
+                }
+            } catch(e) {}
+        }
+
+        const isCacheValid = (cachedHash === currentHash);
+        if (isCacheValid && cachedHTML) {
+            currentTranslationHTML = cachedHTML;
+            isStale = false;
+        } else if (cachedHTML) {
+            currentTranslationHTML = cachedHTML;
+            isStale = true;
+        }
+
+        function applyTranslationToDOM(html, staleFlag) {
+            const displayHTML = staleFlag ? OUTDATED_MARKER + html : html;
+            container.innerHTML = displayHTML;
+        }
+
+        function applyOriginalToDOM() {
+            container.innerHTML = originalHTML;
+        }
+
+        function updateButtonTitle() {
+            btn.title = showingTranslation ? BUTTON_TITLE_TRANS : BUTTON_TITLE_ORIG;
+        }
+
+        async function tryRefreshStale() {
+            if (!isStale || !currentTranslationHTML) return;
+            if (fetchPromise) return fetchPromise;
+            fetchPromise = (async () => {
+                try {
+                    const freshHTML = await translateHTML(originalHTML);
+                    const freshHash = simpleHash(originalText);
+                    GM_setValue(cacheKey, JSON.stringify({ html: freshHTML, hash: freshHash }));
+                    currentTranslationHTML = freshHTML;
+                    isStale = false;
+                    if (showingTranslation) {
+                        applyTranslationToDOM(currentTranslationHTML, false);
+                    }
+                } catch (err) {
+                    console.warn('Не удалось обновить устаревший перевод:', err);
+                } finally {
+                    fetchPromise = null;
+                }
+            })();
+            return fetchPromise;
+        }
+
+        const btn = document.createElement('span');
+        btn.className = 'mal-synopsis-translate-btn';
+        btn.innerHTML = TRANSLATE_ICON;
+        btn.title = BUTTON_TITLE_ORIG;
+        buttonParent.appendChild(btn);
+
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (btn.classList.contains('loading')) return;
+
+            if (showingTranslation) {
+                applyOriginalToDOM();
+                showingTranslation = false;
+                updateButtonTitle();
+                return;
+            }
+
+            if (currentTranslationHTML) {
+                applyTranslationToDOM(currentTranslationHTML, isStale);
+                showingTranslation = true;
+                updateButtonTitle();
+                if (isStale && !fetchPromise) {
+                    tryRefreshStale().catch(console.error);
+                }
+            } else {
+                btn.classList.add('loading');
+                btn.title = 'Перевожу...';
+                try {
+                    const freshHTML = await translateHTML(originalHTML);
+                    const freshHash = simpleHash(originalText);
+                    GM_setValue(cacheKey, JSON.stringify({ html: freshHTML, hash: freshHash }));
+                    currentTranslationHTML = freshHTML;
+                    isStale = false;
+                    applyTranslationToDOM(currentTranslationHTML, false);
+                    showingTranslation = true;
+                    updateButtonTitle();
+                } catch (err) {
+                    console.error('Ошибка перевода:', err);
+                    alert('Не удалось перевести синопсис.');
+                } finally {
+                    btn.classList.remove('loading');
+                }
+            }
+        });
+
+        if (isCacheValid && currentTranslationHTML) {
+            applyTranslationToDOM(currentTranslationHTML, false);
+            showingTranslation = true;
+            updateButtonTitle();
+        } else if (currentTranslationHTML && isStale) {
+            applyOriginalToDOM();
+            showingTranslation = false;
+            updateButtonTitle();
+            tryRefreshStale().catch(console.error);
+        } else {
+            applyOriginalToDOM();
+            showingTranslation = false;
+            updateButtonTitle();
+        }
+    }
+
+    function expandSynopsisAndHideToggle() {
+        document.querySelectorAll('.seasonal-anime .synopsis .preline').forEach(pre => {
+            if (!pre.classList.contains('expand')) pre.classList.add('expand');
+        });
+        document.querySelectorAll('.seasonal-anime .synopsis .toggle-text').forEach(btn => {
+            btn.style.display = 'none';
+        });
+    }
+
+    function processSeasonCard(card) {
+        const titleDiv = card.querySelector('.title');
+        const synopsisDiv = card.querySelector('.synopsis');
+        const preline = synopsisDiv ? synopsisDiv.querySelector('.preline') : null;
+        if (!titleDiv || !preline) return;
+        if (!preline.classList.contains('expand')) preline.classList.add('expand');
+
+        const animeId = extractAnimeId(card);
+        if (!animeId) return;
+        const cacheKey = CACHE_PREFIX + animeId;
+
+        setupSynopsisBlock({
+            container: preline,
+            buttonParent: titleDiv,
+            animeId: animeId,
+            cacheKey: cacheKey
+        });
+    }
+
+    function handleSeasonPage() {
+        expandSynopsisAndHideToggle();
+        document.querySelectorAll('.seasonal-anime').forEach(card => processSeasonCard(card));
+
+        const observer = new MutationObserver(mutations => {
+            let needExpand = false;
+            for (const mut of mutations) {
+                for (const node of mut.addedNodes) {
+                    if (node.nodeType === 1) {
+                        if (node.matches && node.matches('.seasonal-anime')) {
+                            processSeasonCard(node);
+                            needExpand = true;
+                        } else if (node.querySelectorAll) {
+                            const cards = node.querySelectorAll('.seasonal-anime');
+                            cards.forEach(card => processSeasonCard(card));
+                            if (cards.length) needExpand = true;
+                        }
+                    }
+                }
+            }
+            if (needExpand) expandSynopsisAndHideToggle();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function handleAnimePage() {
+        const header = document.querySelector('h2#synopsis');
+        if (!header) return false;
+        const synopsisEl = document.querySelector('p[itemprop="description"]');
+        if (!synopsisEl) return false;
+        const animeId = extractAnimeId();
+        if (!animeId) return false;
+        const headerParent = header.closest('div');
+        const cacheKey = CACHE_PREFIX + animeId;
+        setupSynopsisBlock({
+            container: synopsisEl,
+            buttonParent: headerParent,
+            animeId: animeId,
+            cacheKey: cacheKey
+        });
+        return true;
+    }
+
+    function init() {
+        if (location.pathname.includes('/season')) {
+            handleSeasonPage();
+        } else {
+            if (!handleAnimePage()) {
+                console.log('Скрипт: синопсис не найден, возможно, это не страница аниме.');
+            }
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();

@@ -1,0 +1,652 @@
+// ==UserScript==
+// @name         MAL - Построитель хронологии
+// @namespace    https://myanimelist.net/
+// @version      4.6
+// @description  Builds a chronology view for anime/manga using the Jikan API.
+// @grant        GM.xmlHttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @match        https://myanimelist.net/anime/*
+// @match        https://myanimelist.net/manga/*
+// @icon         https://cdn.myanimelist.net/images/favicon.svg
+// @connect      api.jikan.moe
+// ==/UserScript==
+
+/**
+ * MAL Chronology Builder
+ *
+ * This userscript fetches relation data from the Jikan API and displays
+ * a sorted chronology of related anime/manga entries on MyAnimeList pages.
+ * It uses a local cache to reduce API calls and supports force-refreshing.
+ * Prequels and sequels are placed before and after the current entry respectively,
+ * while other relation types are appended at the end. Dates are parsed from
+ * the API and used for sorting.
+ */
+
+(function() {
+    'use strict';
+
+    const DEBUG = true;
+    const log = (...args) => DEBUG && console.log('[Chrono]', ...args);
+    const warn = (...args) => console.warn('[Chrono]', ...args);
+    console.log('[Chrono] Script started');
+
+    const DELAY_MS = 750;
+    const MAX_FETCHES = 100;
+    const MAX_RETRIES = 2;
+    const CACHE_KEY = 'chrono_cache_v2';
+
+    // ---------- Global cache ----------
+    // Uses GM_setValue/GM_getValue to persist fetched data.
+    const loadCache = () => { try { return JSON.parse(GM_getValue(CACHE_KEY, '{}')); } catch(e) { return {}; } };
+    const saveCache = (c) => GM_setValue(CACHE_KEY, JSON.stringify(c));
+    const getCacheEntry = (type, id) => loadCache()[`${type}/${id}`] || null;
+    const setCacheEntry = (type, id, data) => {
+        const cache = loadCache();
+        cache[`${type}/${id}`] = data;
+        saveCache(cache);
+    };
+    const removeCacheEntry = (type, id) => {
+        const cache = loadCache();
+        delete cache[`${type}/${id}`];
+        saveCache(cache);
+    };
+
+    // ---------- Rate limiter ----------
+    // Ensures a minimum delay between API requests to respect Jikan's rate limit.
+    let lastRequestTime = 0;
+    const waitForRateLimit = async () => {
+        const now = Date.now();
+        const wait = Math.max(0, DELAY_MS - (now - lastRequestTime));
+        if (wait > 0) {
+            log(`Rate limit: waiting ${wait}ms`);
+            await new Promise(r => setTimeout(r, wait));
+        }
+        lastRequestTime = Date.now();
+    };
+
+    // ---------- Jikan API with universal retries ----------
+    // Fetches full title data, parses title, date, relations and entry names.
+    // Retries on network errors or non-404 HTTP errors up to MAX_RETRIES.
+    async function fetchTitleInfo(type, id, retryCount = 0) {
+        await waitForRateLimit();
+        const url = `https://api.jikan.moe/v4/${type}/${id}/full`;
+        log(`Requesting ${url} (attempt ${retryCount + 1})`);
+        return new Promise((resolve, reject) => {
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url: url,
+                onload: function(response) {
+                    if (response.status === 200) {
+                        try {
+                            const data = JSON.parse(response.responseText).data;
+                            const title = data.title || '';
+                            const dateIso = data.aired?.from || data.published?.from || '';
+                            const date = dateIso ? dateIso.split('T')[0].replace(/-/g, '.') : '';
+                            const relations = [];
+                            const entryNames = new Map();
+                            if (data.relations) {
+                                data.relations.forEach(rel => {
+                                    const entryKeys = [];
+                                    rel.entry.forEach(e => {
+                                        const entryType = e.type || type;
+                                        const key = `${entryType}/${e.mal_id}`;
+                                        entryKeys.push(key);
+                                        entryNames.set(key, e.name);
+                                    });
+                                    if (entryKeys.length > 0) {
+                                        relations.push({
+                                            relation: rel.relation,
+                                            entry: entryKeys
+                                        });
+                                    }
+                                });
+                            }
+                            log(`Resolved ${url}: title="${title}", date="${date}"`);
+                            resolve({ title, date, relations, animeType: data.type || null, entryNames });
+                        } catch (e) {
+                            if (retryCount < MAX_RETRIES) {
+                                warn(`JSON parse error, retrying in 1s...`);
+                                setTimeout(() => {
+                                    fetchTitleInfo(type, id, retryCount + 1).then(resolve).catch(reject);
+                                }, 1000);
+                            } else {
+                                reject(new Error('JSON parse error after retries'));
+                            }
+                        }
+                    } else if (response.status === 404) {
+                        reject(new Error('Not found'));
+                    } else if (retryCount < MAX_RETRIES) {
+                        warn(`HTTP ${response.status}, retrying in 1s...`);
+                        setTimeout(() => {
+                            fetchTitleInfo(type, id, retryCount + 1).then(resolve).catch(reject);
+                        }, 1000);
+                    } else {
+                        reject(new Error(`HTTP ${response.status} after retries`));
+                    }
+                },
+                onerror: function() {
+                    if (retryCount < MAX_RETRIES) {
+                        warn(`Network error, retrying in 1s...`);
+                        setTimeout(() => {
+                            fetchTitleInfo(type, id, retryCount + 1).then(resolve).catch(reject);
+                        }, 1000);
+                    } else {
+                        reject(new Error('Network error after retries'));
+                    }
+                }
+            });
+        });
+    }
+
+    // ---------- Data retrieval with cache support ----------
+    // Checks cache first; falls back to API call. Marks incomplete entries if fetch fails.
+    async function getCachedOrFetch(type, id, force) {
+        if (!force) {
+            const cached = getCacheEntry(type, id);
+            if (cached && !cached.incomplete && cached.date) {
+                log(`Cache hit (complete) for ${type}/${id}`);
+                const entryNames = new Map();
+                if (cached.relations) {
+                    cached.relations.forEach(rel => {
+                        rel.entry.forEach(entryKey => {
+                            const [eType, eIdStr] = entryKey.split('/');
+                            const eId = parseInt(eIdStr, 10);
+                            const eCached = getCacheEntry(eType, eId);
+                            if (eCached && eCached.title) {
+                                entryNames.set(entryKey, eCached.title);
+                            }
+                        });
+                    });
+                }
+                return {
+                    title: cached.title,
+                    date: cached.date,
+                    relations: cached.relations || [],
+                    animeType: cached.animeType || null,
+                    entryNames: entryNames
+                };
+            }
+            if (cached && cached.incomplete) {
+                log(`Cache incomplete for ${type}/${id}, trying to fetch...`);
+            }
+        }
+
+        log(`Fetching fresh data for ${type}/${id} (force=${force})`);
+        try {
+            const info = await fetchTitleInfo(type, id);
+            setCacheEntry(type, id, {
+                title: info.title,
+                date: info.date,
+                relations: info.relations,
+                animeType: info.animeType,
+                cachedAt: new Date().toISOString(),
+                incomplete: false
+            });
+            return info;
+        } catch (err) {
+            warn(`Failed to fetch ${type}/${id}:`, err);
+            const cached = getCacheEntry(type, id);
+            if (cached) {
+                log(`Returning cached (possibly incomplete) data for ${type}/${id}`);
+                const entryNames = new Map();
+                if (cached.relations) {
+                    cached.relations.forEach(rel => {
+                        rel.entry.forEach(entryKey => {
+                            const [eType, eIdStr] = entryKey.split('/');
+                            const eId = parseInt(eIdStr, 10);
+                            const eCached = getCacheEntry(eType, eId);
+                            if (eCached && eCached.title) {
+                                entryNames.set(entryKey, eCached.title);
+                            }
+                        });
+                    });
+                }
+                return {
+                    title: cached.title || '',
+                    date: cached.date || '',
+                    relations: cached.relations || [],
+                    animeType: cached.animeType || null,
+                    entryNames: entryNames
+                };
+            }
+            throw err;
+        }
+    }
+
+    // ---------- Collect all related IDs from cache (any relation) ----------
+    // BFS traversal through cached relations to find every reachable ID.
+    // Used during force-refresh to clean orphaned entries.
+    function collectAllRelatedIds(startType, startId) {
+        const ids = new Set();
+        const queue = [{ type: startType, id: startId }];
+        while (queue.length > 0) {
+            const { type, id } = queue.shift();
+            const key = `${type}/${id}`;
+            if (ids.has(key)) continue;
+            ids.add(key);
+            const cached = getCacheEntry(type, id);
+            if (!cached || !cached.relations) continue;
+            cached.relations.forEach(rel => {
+                rel.entry.forEach(entryKey => {
+                    if (!ids.has(entryKey)) {
+                        const [entryType, entryIdStr] = entryKey.split('/');
+                        const entryId = parseInt(entryIdStr, 10);
+                        if (!isNaN(entryId)) {
+                            queue.push({ type: entryType, id: entryId });
+                        }
+                    }
+                });
+            });
+        }
+        return ids;
+    }
+
+    // ---------- GUI ----------
+    // Helper to style relation badges differently for prequels/sequels.
+    function getBadgeColors(text) {
+        const lower = text.toLowerCase();
+        const isPrequelOrSequel = lower.includes('prequel') || lower.includes('sequel');
+        return { bg: isPrequelOrSequel ? '#FFDAB9' : '#e9ecef', fg: '#212529' };
+    }
+
+    // Replaces the "Related Entries" section with a loading indicator.
+    function setLoadingState() {
+        const heading = document.querySelector('#related_entries');
+        if (heading) {
+            const old = document.getElementById('chrono-cache-date');
+            if (old) old.remove();
+            const span = document.createElement('span');
+            span.id = 'chrono-cache-date';
+            span.style.cssText = 'font-size:12px; margin-left:8px; cursor:pointer;';
+            span.textContent = '(↻)';
+            span.title = 'Принудительно обновить';
+            span.addEventListener('click', () => {
+                if (isBuilding) {
+                    warn('Already building, please wait.');
+                    return;
+                }
+                buildChronology(true);
+            });
+            heading.appendChild(span);
+        }
+        const section = document.querySelector('.related-entries');
+        if (!section) return;
+        const oldLoading = document.getElementById('chrono-loading');
+        if (oldLoading) oldLoading.remove();
+        const loadingDiv = document.createElement('div');
+        loadingDiv.id = 'chrono-loading';
+        loadingDiv.textContent = 'Building chronology...';
+        loadingDiv.style.cssText = 'text-align:center;padding:20px;font-size:16px;color:#555;';
+        section.appendChild(loadingDiv);
+        Array.from(section.children).forEach(child => {
+            if (child !== loadingDiv) child.style.display = 'none';
+        });
+    }
+
+    // Restores the heading and removes the loading indicator.
+    function setReadyState() {
+        const now = new Date().toISOString().split('T')[0].replace(/-/g, '.');
+        const heading = document.querySelector('#related_entries');
+        if (heading) {
+            const old = document.getElementById('chrono-cache-date');
+            if (old) old.remove();
+            const span = document.createElement('span');
+            span.id = 'chrono-cache-date';
+            span.style.cssText = 'font-size:12px; margin-left:8px; cursor:pointer;';
+            span.textContent = `(${now} ↻)`;
+            span.title = 'Принудительно обновить хронологию';
+            span.addEventListener('click', () => {
+                if (isBuilding) {
+                    warn('Already building, please wait.');
+                    return;
+                }
+                buildChronology(true);
+            });
+            heading.appendChild(span);
+        }
+        const loadingDiv = document.getElementById('chrono-loading');
+        if (loadingDiv) loadingDiv.remove();
+    }
+
+    // Displays an error message instead of the chronology.
+    function setErrorState(message) {
+        const loadingDiv = document.getElementById('chrono-loading');
+        if (loadingDiv) {
+            loadingDiv.textContent = message || 'Error loading data.';
+        } else {
+            const section = document.querySelector('.related-entries');
+            if (section) {
+                const div = document.createElement('div');
+                div.id = 'chrono-loading';
+                div.textContent = message || 'Error loading data.';
+                div.style.cssText = 'text-align:center;padding:20px;font-size:16px;color:#555;';
+                section.appendChild(div);
+            }
+        }
+    }
+
+    // Renders the final sorted table into the page.
+    function renderTable(sortedEntries) {
+        const section = document.querySelector('.related-entries');
+        if (!section) return;
+        section.innerHTML = '';
+        const table = document.createElement('table');
+        table.classList.add('entries-table');
+        const tbody = document.createElement('tbody');
+        table.appendChild(tbody);
+
+        sortedEntries.forEach(entry => {
+            const row = document.createElement('tr');
+            if (entry.isCurrent) row.classList.add('current-entry');
+
+            // Date
+            const dateCell = document.createElement('td');
+            dateCell.className = 'borderClass';
+            dateCell.style.whiteSpace = 'nowrap';
+            dateCell.style.padding = '4px 8px';
+            dateCell.textContent = entry.date || '';
+            row.appendChild(dateCell);
+
+            // Relation type badge
+            const relCell = document.createElement('td');
+            relCell.className = 'borderClass';
+            if (entry.relation) {
+                const badge = document.createElement('span');
+                badge.textContent = entry.relation;
+                const colors = getBadgeColors(entry.relation);
+                Object.assign(badge.style, {
+                    backgroundColor: colors.bg,
+                    color: colors.fg,
+                    padding: '2px 6px',
+                    borderRadius: '5px',
+                    fontSize: '11px',
+                    whiteSpace: 'nowrap'
+                });
+                relCell.appendChild(badge);
+            }
+            row.appendChild(relCell);
+
+            // Title
+            const titleCell = document.createElement('td');
+            titleCell.className = 'borderClass';
+            if (entry.url && !entry.isCurrent) {
+                const a = document.createElement('a');
+                a.href = entry.url;
+                a.textContent = entry.title || '(no title)';
+                titleCell.appendChild(a);
+            } else {
+                titleCell.textContent = entry.title || '(no title)';
+            }
+            row.appendChild(titleCell);
+
+            tbody.appendChild(row);
+        });
+
+        section.appendChild(table);
+    }
+
+    // ---------- Main builder ----------
+    // Coordinates the whole process: fetches data for the current page,
+    // then recursively fetches prequels/sequels, collects all side entries,
+    // sorts them, and renders the final table.
+    let isBuilding = false;
+
+    async function buildChronology(forceRefresh = false) {
+        if (isBuilding) {
+            warn('Build already in progress');
+            return;
+        }
+        isBuilding = true;
+        try {
+            log(`Starting buildChronology (force=${forceRefresh})`);
+            await new Promise(resolve => {
+                const check = () => {
+                    if (document.querySelector('.related-entries') && document.querySelector('.h1-title .title-name')) {
+                        resolve();
+                    } else {
+                        setTimeout(check, 200);
+                    }
+                };
+                check();
+            });
+
+            const section = document.querySelector('.related-entries');
+            if (!section) return;
+
+            const pathMatch = location.pathname.match(/\/(anime|manga)\/(\d+)/);
+            if (!pathMatch) return;
+            const currentType = pathMatch[1];
+            const currentId = parseInt(pathMatch[2], 10);
+            const currentUrl = `https://myanimelist.net/${currentType}/${currentId}/`;
+            const currentTitleEl = document.querySelector('.h1-title .title-name');
+            const currentTitle = currentTitleEl ? currentTitleEl.textContent.trim() : '';
+
+            setLoadingState();
+
+            let oldIds = new Set();
+            if (forceRefresh) {
+                oldIds = collectAllRelatedIds(currentType, currentId);
+                log(`Old related IDs: ${[...oldIds].join(', ')}`);
+            }
+
+            let currentData;
+            try {
+                currentData = await getCachedOrFetch(currentType, currentId, forceRefresh);
+            } catch (err) {
+                warn('Failed to fetch current title:', err);
+                const cached = getCacheEntry(currentType, currentId);
+                if (cached) {
+                    currentData = {
+                        title: cached.title || currentTitle,
+                        date: cached.date || '',
+                        relations: cached.relations || [],
+                        animeType: cached.animeType || null,
+                        entryNames: new Map()
+                    };
+                } else {
+                    setErrorState('Error loading data.');
+                    return;
+                }
+            }
+
+            const entries = [];
+            const entryMap = new Map();
+            const addedToQueue = new Set();
+            const globalEntryNames = new Map();
+            let fetchCount = 0;
+
+            function updateEntryNames(namesMap) {
+                if (namesMap) {
+                    for (const [key, name] of namesMap.entries()) {
+                        if (!globalEntryNames.has(key)) {
+                            globalEntryNames.set(key, name);
+                        }
+                    }
+                }
+            }
+            updateEntryNames(currentData.entryNames);
+
+            // Creates a new entry object and registers it.
+            function addEntry(key, relation, sourceTitle = null, isCurrent = false) {
+                if (entryMap.has(key)) return entryMap.get(key);
+                const [type, idStr] = key.split('/');
+                const id = parseInt(idStr, 10);
+                const url = `https://myanimelist.net/${type}/${id}/`;
+                let title = globalEntryNames.get(key) || '';
+                if (!title) {
+                    const cached = getCacheEntry(type, id);
+                    if (cached && cached.title) title = cached.title;
+                }
+                const entry = {
+                    key,
+                    title,
+                    url,
+                    type,
+                    id,
+                    relation: relation,
+                    relationLower: relation.toLowerCase(),
+                    source: sourceTitle ? { title: sourceTitle, url: currentUrl } : null,
+                    date: '',
+                    loaded: false,
+                    isCurrent
+                };
+                entries.push(entry);
+                entryMap.set(key, entry);
+                return entry;
+            }
+
+            const currentKey = `${currentType}/${currentId}`;
+            const currentEntry = addEntry(currentKey, '', null, true);
+            currentEntry.title = currentTitle;
+            currentEntry.date = currentData.date;
+            currentEntry.loaded = true;
+
+            const queue = [];
+
+            // Seed the queue with direct prequels/sequels from the current entry.
+            for (const rel of currentData.relations) {
+                for (const entryKey of rel.entry) {
+                    if (entryKey === currentKey) continue;
+                    const entry = addEntry(entryKey, rel.relation, currentTitle);
+                    if (rel.relation.toLowerCase().includes('prequel') || rel.relation.toLowerCase().includes('sequel')) {
+                        if (!addedToQueue.has(entryKey)) {
+                            addedToQueue.add(entryKey);
+                            queue.push({ key: entryKey, entryObj: entry });
+                        }
+                    }
+                }
+            }
+
+            // BFS through prequel/sequel relations up to MAX_FETCHES.
+            while (queue.length > 0 && fetchCount < MAX_FETCHES) {
+                const { key, entryObj } = queue.shift();
+                if (entryObj.loaded) continue;
+                const [type, idStr] = key.split('/');
+                const id = parseInt(idStr, 10);
+
+                log(`Processing queue: ${key} (${entryObj.title || '?'})`);
+                let data;
+                try {
+                    data = await getCachedOrFetch(type, id, forceRefresh);
+                    fetchCount++;
+                    updateEntryNames(data.entryNames);
+                } catch (err) {
+                    warn(`Failed to fetch ${key}:`, err);
+                    const cached = getCacheEntry(type, id);
+                    if (cached && cached.date) {
+                        data = {
+                            title: cached.title,
+                            date: cached.date,
+                            relations: cached.relations,
+                            animeType: cached.animeType,
+                            entryNames: new Map()
+                        };
+                    } else {
+                        if (!cached || cached.incomplete) {
+                            setCacheEntry(type, id, {
+                                title: entryObj.title || globalEntryNames.get(key) || '',
+                                date: '',
+                                relations: [],
+                                animeType: null,
+                                cachedAt: new Date().toISOString(),
+                                incomplete: true
+                            });
+                        }
+                        entryObj.loaded = true;
+                        continue;
+                    }
+                }
+
+                entryObj.title = data.title || entryObj.title;
+                entryObj.date = data.date;
+                entryObj.loaded = true;
+                if (data.animeType && entryObj.relation && !entryObj.relation.includes('(')) {
+                    entryObj.relation = `${entryObj.relation} (${data.animeType})`;
+                }
+
+                // Enqueue further prequels/sequels found in this entry.
+                for (const rel of data.relations) {
+                    for (const entryKey of rel.entry) {
+                        if (entryKey === currentKey) continue;
+                        const newEntry = addEntry(entryKey, rel.relation, data.title);
+                        if (rel.relation.toLowerCase().includes('prequel') || rel.relation.toLowerCase().includes('sequel')) {
+                            if (!addedToQueue.has(entryKey) && !newEntry.loaded) {
+                                addedToQueue.add(entryKey);
+                                queue.push({ key: entryKey, entryObj: newEntry });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fetch remaining side entries (non-prequel/sequel) that haven't been loaded.
+            for (const entry of entries) {
+                if (entry.loaded) continue;
+                if (fetchCount >= MAX_FETCHES) break;
+                const { type, id } = entry;
+                try {
+                    const data = await getCachedOrFetch(type, id, forceRefresh);
+                    fetchCount++;
+                    updateEntryNames(data.entryNames);
+                    entry.title = data.title || entry.title;
+                    entry.date = data.date;
+                    entry.loaded = true;
+                    if (data.animeType && entry.relation && !entry.relation.includes('(')) {
+                        entry.relation = `${entry.relation} (${data.animeType})`;
+                    }
+                } catch (err) {
+                    warn(`Failed to fetch side ${type}/${id}:`, err);
+                    const cached = getCacheEntry(type, id);
+                    if (!cached || cached.incomplete) {
+                        setCacheEntry(type, id, {
+                            title: entry.title || globalEntryNames.get(`${type}/${id}`) || '',
+                            date: '',
+                            relations: [],
+                            animeType: null,
+                            cachedAt: new Date().toISOString(),
+                            incomplete: true
+                        });
+                    }
+                    entry.loaded = true;
+                }
+            }
+
+            // Sort entries: prequels → current → sequels → others.
+            const sortByDate = (a, b) => {
+                if (a.date && b.date) return a.date.localeCompare(b.date);
+                if (a.date) return -1;
+                if (b.date) return 1;
+                return 0;
+            };
+            const prequels = entries.filter(e => e.relationLower.includes('prequel') && !e.isCurrent).sort(sortByDate);
+            const sequels = entries.filter(e => e.relationLower.includes('sequel') && !e.isCurrent).sort(sortByDate);
+            const current = entries.find(e => e.isCurrent);
+            const others = entries.filter(e => !e.relationLower.includes('prequel') && !e.relationLower.includes('sequel') && !e.isCurrent).sort(sortByDate);
+            const sortedEntries = [...prequels, current, ...sequels, ...others].filter(Boolean);
+
+            renderTable(sortedEntries);
+
+            // On force refresh, remove cache entries that are no longer reachable.
+            if (forceRefresh) {
+                const newIds = new Set(entries.map(e => e.key));
+                for (const oldKey of oldIds) {
+                    if (!newIds.has(oldKey)) {
+                        const [type, idStr] = oldKey.split('/');
+                        removeCacheEntry(type, parseInt(idStr, 10));
+                        log(`Removed obsolete cache entry: ${oldKey}`);
+                    }
+                }
+            }
+
+            setReadyState();
+        } catch (err) {
+            console.error('[Chrono] Fatal error:', err);
+            setErrorState('Fatal error. Check console.');
+        } finally {
+            isBuilding = false;
+        }
+    }
+
+    buildChronology(false).catch(err => console.error('[Chrono] Fatal error:', err));
+})();

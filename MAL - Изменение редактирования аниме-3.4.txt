@@ -1,0 +1,291 @@
+// ==UserScript==
+// @name         MAL - Изменение редактирования аниме
+// @namespace    http://tampermonkey.net/
+// @version      3.4
+// @description  Переносит Start Date и Finish Date в расширенную секцию, переводит поля. Кнопка + добавляет дату в заметки (всегда в одну группу скобок) и в теги.
+// @author       User
+// @match        https://myanimelist.net/ownlist/anime/*/edit
+// @icon         https://cdn.myanimelist.net/images/favicon.svg
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ========== СЛОВАРЬ ПЕРЕВОДА ==========
+    const translations = {
+        'Anime Title': 'Название аниме',
+        'Status': 'Статус',
+        'Episodes Watched': 'Просмотрено эпизодов',
+        'Your Score': 'Ваша оценка',
+        'Start Date': 'Дата начала',
+        'Finish Date': 'Дата завершения',
+        'Tags': 'Теги',
+        'Priority': 'Приоритет',
+        'Storage': 'Хранение',
+        'Total Times\nRe-watched Series': 'Количество пересмотров',
+        'Rewatch Value': 'Ценность пересмотра',
+        'Notes': 'Заметки',
+        'Ask to Discuss?': 'Спрашивать об обсуждении?',
+        'Post to SNS': 'Публиковать в соцсетях',
+    };
+
+    function translateLabel(row) {
+        if (!row || !row.cells[0]) return;
+        const labelCell = row.cells[0];
+        const originalText = labelCell.innerText.trim();
+        for (const [eng, rus] of Object.entries(translations)) {
+            const normalizedEng = eng.replace(/\n/g, ' ');
+            const normalizedText = originalText.replace(/\n/g, ' ');
+            if (normalizedText === normalizedEng) {
+                labelCell.innerText = rus;
+                break;
+            }
+        }
+    }
+
+    function addStepper(inputElement) {
+        if (!inputElement || inputElement.parentNode.querySelector('.times-stepper')) return;
+        const container = document.createElement('span');
+        container.className = 'times-stepper';
+        container.style.marginLeft = '10px';
+        const decBtn = document.createElement('button');
+        decBtn.textContent = '−';
+        decBtn.type = 'button';
+        decBtn.style.marginRight = '5px';
+        decBtn.style.width = '24px';
+        decBtn.style.cursor = 'pointer';
+        const incBtn = document.createElement('button');
+        incBtn.textContent = '+';
+        incBtn.type = 'button';
+        incBtn.style.width = '24px';
+        incBtn.style.cursor = 'pointer';
+        decBtn.addEventListener('click', () => {
+            let val = parseInt(inputElement.value, 10);
+            if (isNaN(val)) val = 0;
+            if (val > 0) {
+                inputElement.value = val - 1;
+                inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        });
+        incBtn.addEventListener('click', () => {
+            let val = parseInt(inputElement.value, 10);
+            if (isNaN(val)) val = 0;
+            inputElement.value = val + 1;
+            inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        container.appendChild(decBtn);
+        container.appendChild(incBtn);
+        inputElement.parentNode.appendChild(container);
+    }
+
+    function getCurrentDateYYYYMM() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        return `${year}${month}`;
+    }
+
+    // ИСПРАВЛЕННАЯ ФУНКЦИЯ: всегда работает с одной группой скобок
+    function addDateToNotes(textarea) {
+        const currentDate = getCurrentDateYYYYMM();
+        let text = textarea.value;
+
+        // Ищем ПЕРВУЮ группу скобок (и единственную)
+        const parenRegex = /\(([^)]*)\)/;
+        const match = text.match(parenRegex);
+
+        if (match) {
+            // Группа уже есть: добавляем дату внутрь через запятую
+            const fullMatch = match[0];      // "(старое содержимое)"
+            const inner = match[1];           // "старое содержимое"
+            let newInner;
+            if (inner.trim() === "") {
+                newInner = currentDate;
+            } else {
+                newInner = inner + ', ' + currentDate;
+            }
+            const newFullMatch = '(' + newInner + ')';
+            text = text.replace(parenRegex, newFullMatch);
+        } else {
+            // Нет скобок — добавляем новые в конец
+            const trimmed = text.trimEnd();
+            const suffix = text.slice(trimmed.length);
+            text = trimmed + (trimmed ? ' ' : '') + '(' + currentDate + ')' + suffix;
+        }
+
+        textarea.value = text;
+    }
+
+    function addDateToTags() {
+        const tagsTextarea = document.getElementById('add_anime_tags');
+        if (!tagsTextarea) return;
+        const currentDate = getCurrentDateYYYYMM();
+        let tagsValue = tagsTextarea.value.trim();
+        if (tagsValue === "") {
+            tagsTextarea.value = currentDate;
+            return;
+        }
+        let tagsArray = tagsValue.split(',').map(tag => tag.trim());
+        if (!tagsArray.includes(currentDate)) {
+            tagsArray.push(currentDate);
+            tagsTextarea.value = tagsArray.join(', ');
+        }
+    }
+
+    function setupNotesDateButton() {
+        const textarea = document.getElementById('add_anime_comments');
+        if (!textarea) return;
+        if (textarea.parentNode.querySelector('.mal-add-date-btn')) return;
+
+        const btn = document.createElement('span');
+        btn.className = 'mal-add-date-btn';
+        btn.textContent = '+';
+        btn.title = 'Добавить текущую дату (ГГГГММ) в заметки и теги';
+        btn.style.cssText = `
+            display: inline-block;
+            margin-left: 8px;
+            width: 24px;
+            height: 24px;
+            line-height: 22px;
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            color: #2e7d32;
+            cursor: pointer;
+            user-select: none;
+            vertical-align: middle;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background: #f5f5f5;
+        `;
+        btn.addEventListener('mouseenter', () => btn.style.background = '#e0e0e0');
+        btn.addEventListener('mouseleave', () => btn.style.background = '#f5f5f5');
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            addDateToNotes(textarea);
+            addDateToTags();
+        });
+
+        const parentTd = textarea.closest('td');
+        if (parentTd) {
+            const publicNotesCheckbox = parentTd.querySelector('input[name="public_notes"]');
+            const publicNotesDiv = publicNotesCheckbox ? publicNotesCheckbox.closest('div') : null;
+            if (publicNotesDiv) {
+                parentTd.insertBefore(btn, publicNotesDiv);
+            } else {
+                parentTd.appendChild(btn);
+            }
+        } else {
+            textarea.insertAdjacentElement('afterend', btn);
+        }
+    }
+
+    function setupPublicNotesCheckbox() {
+        const checkbox = document.querySelector('input[name="public_notes"]');
+        if (!checkbox) return;
+        checkbox.checked = false;
+        const label = checkbox.closest('label');
+        if (label) {
+            const small = label.querySelector('small');
+            if (small) small.textContent = 'Отправить заметку в ленту друзей';
+        }
+    }
+
+    function reorganize() {
+        const mainTable = document.querySelector('#dialog form > table:first-child');
+        if (!mainTable) return;
+        const mainTbody = mainTable.tBodies[0];
+        const advTable = document.querySelector('#dialog table.advanced');
+        if (!advTable) return;
+        const advTbody = advTable.tBodies[0];
+
+        const startRow = findRowByLabel(mainTbody, 'Start Date');
+        const finishRow = findRowByLabel(mainTbody, 'Finish Date');
+        if (startRow) {
+            const notesRowAdv = findRowByLabel(advTbody, 'Notes');
+            if (notesRowAdv) notesRowAdv.insertAdjacentElement('beforebegin', startRow);
+            else advTbody.insertBefore(startRow, advTbody.firstChild);
+        }
+        if (finishRow) {
+            const startRowAdv = findRowByLabel(advTbody, 'Start Date');
+            if (startRowAdv) startRowAdv.insertAdjacentElement('afterend', finishRow);
+            else {
+                const notesRowAdv = findRowByLabel(advTbody, 'Notes');
+                if (notesRowAdv) notesRowAdv.insertAdjacentElement('beforebegin', finishRow);
+                else advTbody.insertBefore(finishRow, advTbody.firstChild);
+            }
+        }
+
+        let notesRowMain = findRowByLabel(mainTbody, 'Notes');
+        let timesRowMain = findRowByLabel(mainTbody, 'Total Times\nRe-watched Series');
+        if (!notesRowMain) {
+            const notesRowAdv = findRowByLabel(advTbody, 'Notes');
+            if (notesRowAdv) {
+                const yourScoreRow = findRowByLabel(mainTbody, 'Your Score');
+                if (yourScoreRow) yourScoreRow.insertAdjacentElement('afterend', notesRowAdv);
+                else mainTbody.appendChild(notesRowAdv);
+                notesRowMain = notesRowAdv;
+            }
+        }
+        if (!timesRowMain) {
+            const timesRowAdv = findRowByLabel(advTbody, 'Total Times\nRe-watched Series');
+            if (timesRowAdv) {
+                if (notesRowMain) notesRowMain.insertAdjacentElement('afterend', timesRowAdv);
+                else {
+                    const yourScoreRow = findRowByLabel(mainTbody, 'Your Score');
+                    if (yourScoreRow) yourScoreRow.insertAdjacentElement('afterend', timesRowAdv);
+                    else mainTbody.appendChild(timesRowAdv);
+                }
+                const timesInput = timesRowAdv.querySelector('#add_anime_num_watched_times');
+                if (timesInput) addStepper(timesInput);
+            }
+        }
+
+        for (let row of mainTbody.rows) translateLabel(row);
+        for (let row of advTbody.rows) translateLabel(row);
+
+        setupNotesDateButton();
+        setupPublicNotesCheckbox();
+
+        if (!document.getElementById('mal-stepper-style')) {
+            const style = document.createElement('style');
+            style.id = 'mal-stepper-style';
+            style.textContent = `
+                .times-stepper button {
+                    background: #f0f0f0;
+                    border: 1px solid #aaa;
+                    border-radius: 3px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    line-height: 1;
+                    padding: 2px 6px;
+                    cursor: pointer;
+                }
+                .times-stepper button:hover {
+                    background: #e0e0e0;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    function findRowByLabel(tbody, labelText) {
+        for (let row of tbody.rows) {
+            const firstCell = row.cells[0];
+            if (firstCell) {
+                const text = firstCell.innerText.trim().replace(/\n/g, ' ');
+                const target = labelText.replace(/\n/g, ' ');
+                if (text === target) return row;
+            }
+        }
+        return null;
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', reorganize);
+    } else {
+        reorganize();
+    }
+})();
